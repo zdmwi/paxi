@@ -18,6 +18,10 @@ func NewQuorum() *Quorum {
 	return q
 }
 
+func (q *Quorum) GetACKs() map[ID]bool {
+	return q.acks
+}
+
 // ACK adds id to quorum ack records
 func (q *Quorum) ACK(id ID) {
 	if !q.acks[id] {

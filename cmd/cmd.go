@@ -8,10 +8,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/ailidani/paxi/chain"
-
 	"github.com/ailidani/paxi"
-	"github.com/ailidani/paxi/paxos"
+	"github.com/ailidani/paxi/matchmakerpaxos"
 )
 
 var id = flag.String("id", "", "node id this client connects to")
@@ -110,12 +108,8 @@ func main() {
 	admin = paxi.NewHTTPClient(paxi.ID(*id))
 
 	switch *algorithm {
-	case "paxos":
-		client = paxos.NewClient(paxi.ID(*id))
-
-	case "chain":
-		client = chain.NewClient()
-
+	case "matchmakerpaxos":
+		client = matchmakerpaxos.NewClient(paxi.ID(*id))
 	default:
 		client = paxi.NewHTTPClient(paxi.ID(*id))
 	}

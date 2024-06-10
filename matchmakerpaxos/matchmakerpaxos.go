@@ -1,10 +1,13 @@
 package matchmakerpaxos
 
 import (
+	"fmt"
+	"math/rand"
 	"strconv"
 	"time"
 
 	"github.com/ailidani/paxi"
+	"github.com/ailidani/paxi/log"
 )
 
 // entry in log
@@ -17,35 +20,109 @@ type entry struct {
 	timestamp time.Time
 }
 
+type QuorumSystemType int
+
+const (
+	SimpleMajority QuorumSystemType = iota + 1
+)
+
+func (qs QuorumSystemType) String() string {
+	return [...]string{"SimpleMajority"}[qs-1]
+}
+
+type QuorumSystem struct {
+	QuorumType QuorumSystemType
+	Members    []paxi.ID
+}
+
+func newQuorumSystem(quorumType QuorumSystemType, members []paxi.ID) *QuorumSystem {
+	q := &QuorumSystem{
+		QuorumType: quorumType,
+		Members:    members,
+	}
+	return q
+}
+
+func (qs QuorumSystem) String() string {
+	return fmt.Sprintf("QuorumSystem {t=%v, m=%v}", qs.QuorumType, qs.Members)
+}
+
+type Configuration struct {
+	Acceptors    []paxi.ID
+	Phase1Quorum QuorumSystem
+	Phase2Quorum QuorumSystem
+}
+
+func newConfiguration(acceptors []paxi.ID, phase1Quorum QuorumSystem, phase2Quorum QuorumSystem) *Configuration {
+	c := &Configuration{
+		Acceptors:    acceptors,
+		Phase1Quorum: phase1Quorum,
+		Phase2Quorum: phase2Quorum,
+	}
+	return c
+}
+
+func (c Configuration) String() string {
+	return fmt.Sprintf("Configuration {A=%v, P1=%v, P2=%v}", c.Acceptors, c.Phase1Quorum, c.Phase2Quorum)
+}
+
 // Paxos instance
 type MatchmakerPaxos struct {
 	paxi.Node
 
-	log            map[int]*entry // log ordered by slot
-	execute        int            // next execute slot number
-	isActiveLeader bool           // active leader
-	ballot         paxi.Ballot    // highest ballot number
-	slot           int            // highest slot number
-	acceptors      []paxi.ID      // list of known acceptors in the system
+	log                    map[int]*entry // log ordered by slot
+	isActiveLeader         bool
+	matchmakerLog          map[int]*Configuration // log for a matchmakerpaxos node
+	matchmakerHistoryUnion map[paxi.ID]bool       // combination of the union of the config histories
+	numMatchReplies        int                    // count for the number of matchA replies
+	execute                int                    // next execute slot number
+	ballot                 paxi.Ballot            // highest ballot number
+	slot                   int                    // highest slot number
+	highestVoteRound       int                    // highest round voted in
 
-	quorum   *paxi.Quorum    // phase 1 quorum
-	requests []*paxi.Request // phase 1 pending requests
+	// service discovery
+	acceptors   []paxi.ID
+	matchmakers []paxi.ID
+
+	// matchmaker paxos specific
+	configuration       *Configuration
+	prevConfigurations  map[int]*Configuration
+	phase1QuorumReplies map[int]map[paxi.ID]bool
+	phase2QuorumReplies map[int]map[paxi.ID]bool
+
+	quorum                 *paxi.Quorum    // phase 1 quorum
+	requests               []*paxi.Request // phase 1 pending requests
+	pendingPhase1BMessages []Phase1B       // pending phase1B messages
 
 	Q1 func(*paxi.Quorum) bool
 	Q2 func(*paxi.Quorum) bool
 }
 
 // NewMatchmakerPaxos creates new paxos instance
-func NewMatchmakerPaxos(n paxi.Node, acceptors []paxi.ID, options ...func(*MatchmakerPaxos)) *MatchmakerPaxos {
+func NewMatchmakerPaxos(n paxi.Node, acceptors []paxi.ID, matchmakers []paxi.ID, options ...func(*MatchmakerPaxos)) *MatchmakerPaxos {
+	phase1Quorum := newQuorumSystem(SimpleMajority, make([]paxi.ID, 0))
+	phase2Quorum := newQuorumSystem(SimpleMajority, make([]paxi.ID, 0))
+
 	p := &MatchmakerPaxos{
-		Node:      n,
-		log:       make(map[int]*entry, paxi.GetConfig().BufferSize),
-		slot:      -1,
-		acceptors: acceptors,
-		quorum:    paxi.NewQuorum(),
-		requests:  make([]*paxi.Request, 0),
-		Q1:        func(q *paxi.Quorum) bool { return q.Majority() },
-		Q2:        func(q *paxi.Quorum) bool { return q.Majority() },
+		Node:                   n,
+		isActiveLeader:         false,
+		log:                    make(map[int]*entry, paxi.GetConfig().BufferSize),
+		matchmakerLog:          make(map[int]*Configuration, 0),
+		matchmakerHistoryUnion: make(map[paxi.ID]bool, 0),
+		numMatchReplies:        0,
+		slot:                   -1,
+		highestVoteRound:       -1,
+		acceptors:              acceptors,
+		matchmakers:            matchmakers,
+		configuration:          newConfiguration(paxi.GetConfig().Acceptors, *phase1Quorum, *phase2Quorum),
+		prevConfigurations:     make(map[int]*Configuration, 0),
+		phase1QuorumReplies:    make(map[int]map[paxi.ID]bool, 0),
+		phase2QuorumReplies:   	make(map[int]map[paxi.ID]bool, 0),
+		quorum:                 paxi.NewQuorum(),
+		requests:               make([]*paxi.Request, 0),
+		pendingPhase1BMessages: make([]Phase1B, 0),
+		Q1:                     func(q *paxi.Quorum) bool { return q.Majority() },
+		Q2:                     func(q *paxi.Quorum) bool { return q.Majority() },
 	}
 
 	for _, opt := range options {
@@ -55,72 +132,156 @@ func NewMatchmakerPaxos(n paxi.Node, acceptors []paxi.ID, options ...func(*Match
 	return p
 }
 
-// IsLeader indecates if this node is current leader
-func (p *MatchmakerPaxos) IsLeader() bool {
-	leaderID := p.ballot.ID()
-	return p.isActiveLeader || leaderID == p.ID()
-}
+func (p *MatchmakerPaxos) selectRandomConfiguration() *Configuration {
+	phase1QuorumSeen := make(map[paxi.ID]bool)
+	phase2QuorumSeen := make(map[paxi.ID]bool)
 
-func (p *MatchmakerPaxos) GetLeaderID() paxi.ID {
-	return p.ballot.ID()
-}
+	phase1Members := make([]paxi.ID, 0)
+	phase2Members := make([]paxi.ID, 0)
 
-func (p *MatchmakerPaxos) GetBallot() paxi.Ballot {
-	return p.ballot
-}
+	if len(p.acceptors) >= paxi.GetConfig().F*2+1 {
+		for len(phase1Members) <= paxi.GetConfig().F+1 {
+			randomMember := p.acceptors[rand.Intn(len(p.acceptors))]
 
-// HandleRequest handles request and start phase 1 or phase 2
-func (p *MatchmakerPaxos) HandleRequest(r paxi.Request) {
-	if !p.isActiveLeader {
-		p.requests = append(p.requests, &r)
-		if p.ballot.ID() != p.ID() {
-			p.SendP1a()
+			_, isInConfig := phase1QuorumSeen[randomMember]
+			if !isInConfig {
+				phase1Members = append(phase1Members, randomMember)
+				phase1QuorumSeen[randomMember] = true
+			}
+		}
+
+		for len(phase2Members) <= paxi.GetConfig().F+1 {
+			randomMember := p.acceptors[rand.Intn(len(p.acceptors))]
+
+			_, isInConfig := phase2QuorumSeen[randomMember]
+			if !isInConfig {
+				phase2Members = append(phase2Members, randomMember)
+				phase2QuorumSeen[randomMember] = true
+			}
 		}
 	} else {
-		p.SendP2a(&r)
+		phase1Members = append(phase1Members, p.acceptors...)
+		phase2Members = append(phase2Members, p.acceptors...)
+	}
+	phase1Quorum := newQuorumSystem(SimpleMajority, phase1Members)
+	phase2Quorum := newQuorumSystem(SimpleMajority, phase2Members)
+
+	c := newConfiguration(p.acceptors, *phase1Quorum, *phase2Quorum)
+	return c
+}
+
+func (p *MatchmakerPaxos) HandleClientRequest(r paxi.Request) {
+	// update next largest round owned by this proposer
+	p.ballot.Next(p.ID())
+
+	// save the request with the value sent by the client
+	p.requests = append(p.requests, &r)
+
+	// selects an arbitrary simple majority configuration from the known acceptors
+	// this will be done dynamically later
+	p.configuration = p.selectRandomConfiguration()
+
+	for _, matchmakerID := range p.matchmakers {
+		m := MatchA{
+			ReplyTo:       p.ID(),
+			Ballot:        p.ballot, // has the largest round owned by this proposer
+			Slot:          p.slot,
+			Configuration: *p.configuration,
+		}
+		p.Send(matchmakerID, m)
 	}
 }
 
-// P1a starts phase 1 prepare
-func (p *MatchmakerPaxos) SendP1a() {
-	if p.isActiveLeader {
+func (p *MatchmakerPaxos) HandleMatchA(r MatchA) {
+	// if there exists a configuration C_j in round j >= p.Slot
+	// then ignore the MatchA message
+	for j := range p.matchmakerLog {
+		if j >= r.Ballot.N() {
+			// maybe send a nack back to the proposer
+			return
+		}
+	}
+
+	H := make(map[int]*Configuration, 0)
+	for j, C_j := range p.matchmakerLog {
+		H[j] = C_j
+	}
+
+	p.matchmakerLog[r.Ballot.N()] = &r.Configuration
+	m := MatchB{
+		Ballot:               r.Ballot,
+		Slot:                 r.Slot,
+		ConfigurationHistory: H,
+	}
+
+	p.Send(r.ReplyTo, m)
+}
+
+func (p *MatchmakerPaxos) HandleMatchB(r MatchB) {
+	// accumulate responses until we get to f+1 MatchB requests
+	if p.numMatchReplies < paxi.GetConfig().F+1 {
+		p.numMatchReplies++
+		for i, C_i := range r.ConfigurationHistory {
+			if i == r.Ballot.N() {
+				for _, nID := range C_i.Phase1Quorum.Members {
+					p.matchmakerHistoryUnion[nID] = true
+					if _, exists := p.phase1QuorumReplies[p.ballot.N()]; !exists {
+						p.phase1QuorumReplies[r.Ballot.N()] = make(map[paxi.ID]bool)
+					}
+					p.phase1QuorumReplies[r.Ballot.N()][nID] = false
+				}
+
+				for _, nID := range C_i.Phase2Quorum.Members {
+					p.matchmakerHistoryUnion[nID] = true
+				}
+			}
+		}
 		return
 	}
-	p.ballot.Next(p.ID())
-	p.quorum.Reset()
-	p.quorum.ACK(p.ID())
 
-	// send to the group of acceptors
-	for _, nodeID := range p.acceptors {
-		p.Send(nodeID, P1a{Ballot: p.ballot})
+	// save previous configuration
+	p.prevConfigurations = r.ConfigurationHistory
+
+	// once we have f+1 matchB requests we take the union of all
+	// the histories
+	acceptors := make([]paxi.ID, 0)
+	for nID := range p.matchmakerHistoryUnion {
+		acceptors = append(acceptors, nID)
 	}
+
+	// if we don't have any history yet, just select a random configuration
+	// as the acceptors for this round and send the phase1A messages
+	if len(acceptors) == 0 {
+		// based on FPaxos paper, it should be safe to only include the phase1Quorum acceptors
+		// but we follow along with the MatchmakerPaxos paper's algorithms
+		randomConfig := p.selectRandomConfiguration()
+
+		acceptors = append(acceptors, randomConfig.Phase1Quorum.Members...)
+		if _, exists := p.phase1QuorumReplies[r.Ballot.N()]; !exists {
+			p.phase1QuorumReplies[r.Ballot.N()] = make(map[paxi.ID]bool)
+		}
+		for _, nID := range acceptors {
+			p.phase1QuorumReplies[r.Ballot.N()][nID] = false
+		}
+
+		acceptors = append(acceptors, randomConfig.Phase2Quorum.Members...)
+	}
+
+	for _, nID := range acceptors {
+		m := Phase1A{Ballot: p.ballot}
+		p.Send(nID, m)
+	}
+
+	// reset numMatchReplies and matchmaker history
+	p.numMatchReplies = 0
+	p.matchmakerHistoryUnion = make(map[paxi.ID]bool)
 }
 
-// P2a starts phase 2 accept
-func (p *MatchmakerPaxos) SendP2a(r *paxi.Request) {
-	p.slot++
-	p.log[p.slot] = &entry{
-		ballot:    p.ballot,
-		command:   r.Command,
-		request:   r,
-		quorum:    paxi.NewQuorum(),
-		timestamp: time.Now(),
-	}
-	p.log[p.slot].quorum.ACK(p.ID())
-	m := P2a{
-		Ballot:  p.ballot,
-		Slot:    p.slot,
-		Command: r.Command,
-	}
-	p.Broadcast(m)
-}
-
-// HandleP1a handles P1a message
-func (p *MatchmakerPaxos) HandleP1a(m P1a) {
-	// new leader
-	if p.ballot < m.Ballot {
-		p.ballot = m.Ballot
-		p.isActiveLeader = false
+func (p *MatchmakerPaxos) HandlePhase1A(r Phase1A) {
+	// if current largest round seen is bigger than
+	// proposers never get sent these messages so maybe unnecessary
+	if p.ballot < r.Ballot {
+		p.ballot = r.Ballot
 		p.forward()
 	}
 
@@ -132,8 +293,7 @@ func (p *MatchmakerPaxos) HandleP1a(m P1a) {
 		l[s] = CommandBallot{p.log[s].command, p.log[s].ballot}
 	}
 
-	// SendP1b
-	p.Send(m.Ballot.ID(), P1b{
+	p.Send(r.Ballot.ID(), Phase1B{
 		Ballot: p.ballot,
 		ID:     p.ID(),
 		Log:    l,
@@ -158,59 +318,126 @@ func (p *MatchmakerPaxos) update(scb map[int]CommandBallot) {
 	}
 }
 
-// HandleP1b handles P1b message
-func (p *MatchmakerPaxos) HandleP1b(m P1b) {
-	p.update(m.Log)
-
-	// old message
-	if p.ballot > m.Ballot || p.isActiveLeader {
-		return
-	}
-
-	// reject message
-	if p.ballot < m.Ballot {
-		p.ballot = m.Ballot
-		p.isActiveLeader = false
-		p.forward()
-	}
-
-	// ack message
-	// if the current p is the leader and the ballots match (i.e. same term etc.)
-	if p.ID() == m.Ballot.ID() && p.ballot == m.Ballot {
-		p.quorum.ACK(m.ID)
-		if p.Q1(p.quorum) {
-			p.isActiveLeader = true
-			// propose any uncommitted entries
-			for i := p.execute; i <= p.slot; i++ {
-				if p.log[i] == nil || p.log[i].commit {
-					continue
-				}
-				// TODO: select a random quorum of acceptors to send p2a messages to
-				p.log[i].ballot = p.ballot
-				p.log[i].quorum = paxi.NewQuorum()
-				p.log[i].quorum.ACK(p.ID())
-				for nodeID, _ := range p.quorum.GetACKs() {
-					p.Send(nodeID, P2a{
-						Ballot:  p.ballot,
-						Slot:    i,
-						Command: p.log[i].command,
-					})
-				}
-			}
-			// propose new commands
-			for _, req := range p.requests {
-				p.SendP2a(req)
-			}
-			p.requests = make([]*paxi.Request, 0)
-		}
+func (p *MatchmakerPaxos) updatePhase1QuorumReceipts(roundNum int, acceptor paxi.ID) {
+	if _, exists := p.phase1QuorumReplies[roundNum][acceptor]; exists {
+		p.phase1QuorumReplies[roundNum][acceptor] = true
 	}
 }
 
+func (p *MatchmakerPaxos) receivedPhaseBFromAllPhase1Quorums(roundNum int) bool {
+	roundQuorum := p.phase1QuorumReplies[roundNum]
+	for _, responded := range roundQuorum {
+		if !responded {
+			return false
+		}
+	}
+	return true
+}
+
+func(p *MatchmakerPaxos) updatePhase2QuorumReceipts(roundNum int, acceptor paxi.ID) {
+	if _, exists := p.phase2QuorumReplies[roundNum][acceptor]; exists {
+		p.phase2QuorumReplies[roundNum][acceptor] = true
+	}
+}
+
+func (p *MatchmakerPaxos) receivedPhaseBFromAllPhase2Quorums(roundNum int) bool {
+	roundQuorum := p.phase2QuorumReplies[roundNum]
+	for _, responded := range roundQuorum {
+		if !responded {
+			return false
+		}
+	}
+	return true
+}
+
+// HandleP1b handles P1b message
+func (p *MatchmakerPaxos) HandlePhase1B(r Phase1B) {
+	p.update(r.Log)
+
+	// ignore stale messages
+	if p.ballot > r.Ballot {
+		return
+	}
+
+	// mark as received from the sending acceptor
+	p.updatePhase1QuorumReceipts(r.Ballot.N(), r.ID)
+	p.pendingPhase1BMessages = append(p.pendingPhase1BMessages, r)
+
+	p.highestVoteRound = paxi.Max(p.highestVoteRound, r.Ballot.N()) // mark the highest vr in Phase1B
+
+	// wait to receive phase1B messages from a phase1Quorum from every configuration in H
+	if !p.receivedPhaseBFromAllPhase1Quorums(r.Ballot.N()) {
+		log.Debugf("Replies for round %d: %v\n", r.Ballot.N(), p.phase1QuorumReplies[r.Ballot.N()])
+		return
+	}
+
+	log.Debugf("Received phase1B messages from all phase1Quorums for round %d\n", r.Ballot.N())
+
+	// get ready to track which acceptors have responded to phase2A messages
+	p.phase2QuorumReplies[p.ballot.N()] = make(map[paxi.ID]bool)
+
+	// propose any uncommitted entries
+	for i := p.execute; i <= p.slot; i++ {
+		if p.log[i] == nil || p.log[i].commit {
+			continue
+		}
+		p.log[i].ballot = p.ballot
+
+		for _, nID := range p.configuration.Phase1Quorum.Members {
+			p.Send(nID, Phase2A{
+				Ballot:  p.ballot,
+				Slot:    i,
+				Command: p.log[i].command,
+			})
+		}
+
+		for _, nID := range p.configuration.Phase2Quorum.Members {
+			p.Send(nID, Phase2A{
+				Ballot:  p.ballot,
+				Slot:    i,
+				Command: p.log[i].command,
+			})
+			p.phase2QuorumReplies[p.ballot.N()][nID] = false
+		}
+	}
+
+	// propose new commands to every acceptor in our configuration
+	for _, req := range p.requests {
+		p.slot++
+		p.log[p.slot] = &entry{
+			ballot:    p.ballot,
+			command:   req.Command,
+			request:   req,
+			quorum:    paxi.NewQuorum(), // just a place holder for now
+			timestamp: time.Now(),
+		}
+
+		for _, nID := range p.configuration.Phase1Quorum.Members {
+			p.Send(nID, Phase2A{
+				Ballot:  p.ballot,
+				Slot:    p.slot,
+				Command: req.Command,
+			})
+		}
+
+		for _, nID := range p.configuration.Phase2Quorum.Members {
+			p.Send(nID, Phase2A{
+				Ballot:  p.ballot,
+				Slot:    p.slot,
+				Command: req.Command,
+			})
+			p.phase2QuorumReplies[p.ballot.N()][nID] = false
+		}
+	}
+
+	// reset requests
+	p.requests = make([]*paxi.Request, 0)
+}
+
 // HandleP2a handles P2a message
-func (p *MatchmakerPaxos) HandleP2a(m P2a) {
+func (p *MatchmakerPaxos) HandlePhase2A(m Phase2A) {
 	if m.Ballot >= p.ballot {
 		p.ballot = m.Ballot
-		p.isActiveLeader = false
 		// update slot number
 		p.slot = paxi.Max(p.slot, m.Slot)
 		// update entry
@@ -234,7 +461,7 @@ func (p *MatchmakerPaxos) HandleP2a(m P2a) {
 		}
 	}
 
-	p.Send(m.Ballot.ID(), P2b{
+	p.Send(m.Ballot.ID(), Phase2B{
 		Ballot: p.ballot,
 		Slot:   m.Slot,
 		ID:     p.ID(),
@@ -242,62 +469,33 @@ func (p *MatchmakerPaxos) HandleP2a(m P2a) {
 }
 
 // HandleP2b handles P2b message
-func (p *MatchmakerPaxos) HandleP2b(m P2b) {
+func (p *MatchmakerPaxos) HandlePhase2B(m Phase2B) {
 	// old message
 	entry, exist := p.log[m.Slot]
 	if !exist || m.Ballot < entry.ballot || entry.commit {
+		log.Debugf("Recevied old message %v\n", m)
 		return
 	}
 
-	// log.Debugf("Replica %s ===[%v]===>>> Replica %s\n", m.ID, m, p.ID())
-
-	// reject message
 	// node update its ballot number and falls back to acceptor
 	if m.Ballot > p.ballot {
 		p.ballot = m.Ballot
-		p.isActiveLeader = false
 	}
 
-	// ack message
-	// the current slot might still be committed with q2
-	// if no q2 can be formed, this slot will be retried when received p2a or p3
-	if m.Ballot.ID() == p.ID() && m.Ballot == p.log[m.Slot].ballot {
-		p.log[m.Slot].quorum.ACK(m.ID)
-		if p.Q2(p.log[m.Slot].quorum) {
-			p.log[m.Slot].commit = true
-			p.Broadcast(P3{
-				Ballot:  m.Ballot,
-				Slot:    m.Slot,
-				Command: p.log[m.Slot].command,
-			})
-
-			p.exec()
-		}
-	}
-}
-
-// HandleP3 handles phase 3 commit message
-func (p *MatchmakerPaxos) HandleP3(m P3) {
-	// log.Debugf("Replica %s ===[%v]===>>> Replica %s\n", m.Ballot.ID(), m, p.ID())
-
-	p.slot = paxi.Max(p.slot, m.Slot)
-
-	e, exist := p.log[m.Slot]
-	if exist {
-		if !e.command.Equal(m.Command) && e.request != nil {
-			// p.Retry(*e.request)
-			p.Forward(m.Ballot.ID(), *e.request)
-			e.request = nil
-		}
-	} else {
-		p.log[m.Slot] = &entry{}
-		e = p.log[m.Slot]
+	// wait to receive phase2B messages from phase 2 quorum, mark the entry as committed
+	p.updatePhase2QuorumReceipts(m.Ballot.N(), m.ID)
+	if !p.receivedPhaseBFromAllPhase2Quorums(m.Ballot.N()) {
+		log.Debugf("Replies for round %d: %v\n", m.Ballot.N(), p.phase1QuorumReplies[m.Ballot.N()])
+		return
 	}
 
-	e.command = m.Command
-	e.commit = true
+	p.log[m.Slot].commit = true
 
-	p.exec()
+	// execute the log and send a reply
+	if m.Ballot == p.log[m.Slot].ballot {
+		log.Debugf("Executing log... %v\n", p.log)
+		p.exec()
+	}
 }
 
 func (p *MatchmakerPaxos) exec() {
@@ -309,6 +507,7 @@ func (p *MatchmakerPaxos) exec() {
 		// log.Debugf("Replica %s execute [s=%d, cmd=%v]", p.ID(), p.execute, e.command)
 		value := p.Execute(e.command)
 		if e.request != nil {
+			log.Debugf("Sending reply to client\n")
 			reply := paxi.Reply{
 				Command:    e.command,
 				Value:      value,

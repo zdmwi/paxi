@@ -1,12 +1,21 @@
 package matchmakerpaxos
 
 import (
+	"flag"
 	"strconv"
 
 	"github.com/ailidani/paxi"
 	"github.com/ailidani/paxi/log"
 )
 
+var read = flag.String("read", "", "read from \"leader\", \"quorum\" or \"any\" replica")
+
+const (
+	HTTPHeaderSlot       = "Slot"
+	HTTPHeaderBallot     = "Ballot"
+	HTTPHeaderExecute    = "Execute"
+	HTTPHeaderInProgress = "Inprogress"
+)
 
 // Client overwrites read operation for Paxos
 type Client struct {

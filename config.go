@@ -12,6 +12,11 @@ var configFile = flag.String("config", "config.json", "Configuration file for pa
 
 // Config contains every system configuration
 type Config struct {
+	F           int  `json:"f"`           // The maximum number of faulty nodes the system can tolerate
+	Proposers   []ID `json:"proposers"`   // IDs for proposers in the configuration. Should be f + 1 of them
+	Acceptors   []ID `json:"acceptors"`   // IDs for acceptors in the configuration. Should be 2f + 1 of them
+	Matchmakers []ID `json:"matchmakers"` // IDs for matchmakers in the configuration. Should be 2f + 1 of them
+
 	Addrs     map[ID]string `json:"address"`      // address for node communication
 	HTTPAddrs map[ID]string `json:"http_address"` // address for client server communication
 

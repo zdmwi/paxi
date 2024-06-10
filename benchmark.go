@@ -84,6 +84,7 @@ type Benchmark struct {
 
 	wait sync.WaitGroup // waiting for all generated keys to complete
 }
+//TODO: read wpaxos paper to see benchmarking
 
 // NewBenchmark returns new Benchmark object given implementation of DB interface
 func NewBenchmark(db DB) *Benchmark {
@@ -178,7 +179,7 @@ func (b *Benchmark) Run() {
 	stat := Statistic(b.latency)
 	log.Infof("Concurrency = %d", b.Concurrency)
 	log.Infof("Write Ratio = %f", b.W)
-	log.Infof("Number of Keys = %d", b.K)
+	log.Infof("Number of Keys = %d", b.K) 
 	log.Infof("Benchmark Time = %v\n", t)
 	log.Infof("Throughput = %f\n", float64(len(b.latency))/t.Seconds())
 	log.Info(stat)

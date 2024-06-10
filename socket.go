@@ -69,7 +69,7 @@ func NewSocket(id ID, addrs map[ID]string) Socket {
 func (s *socket) Send(to ID, m interface{}) {
 	log.Debugf("node %s send message %+v to %v", s.id, m, to)
 
-	if s.crash {
+	if s.crash { 
 		return
 	}
 

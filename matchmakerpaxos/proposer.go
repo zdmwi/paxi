@@ -2,7 +2,6 @@ package matchmakerpaxos
 
 import (
 	"github.com/ailidani/paxi"
-	"github.com/ailidani/paxi/log"
 )
 
 type Proposer struct {
@@ -23,21 +22,21 @@ func NewProposer(id paxi.ID, acceptors []paxi.ID, matchmakers []paxi.ID) *Propos
 }
 
 func (r *Proposer) handleRequest(m paxi.Request) {
-	log.Debugf("Proposer %s received %v\n", r.ID(), m)
+	// log.Debugf("Proposer %s received %v\n", r.ID(), m)
 	r.MatchmakerPaxos.HandleClientRequest(m)
 }
 
 func (r *Proposer) handleMatchB(m MatchB) {
-	log.Debugf("Proposer %s received %v\n", r.ID(), m)
+	// log.Debugf("Proposer %s received %v\n", r.ID(), m)
 	r.MatchmakerPaxos.HandleMatchB(m)
 }
 
 func (r *Proposer) handlePhase1B(m Phase1B) {
-	log.Debugf("Proposer %s received %v\n", r.ID(), m)
+	// log.Debugf("Proposer %s received %v\n", r.ID(), m)
 	r.MatchmakerPaxos.HandlePhase1B(m)
 }
 
 func (r *Proposer) handlePhase2B(m Phase2B) {
-	log.Debugf("Proposer %s received %v\n", r.ID(), m)
+	// log.Debugf("Proposer %s received %v\n", r.ID(), m)
 	r.MatchmakerPaxos.HandlePhase2B(m)
 }

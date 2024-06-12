@@ -70,8 +70,7 @@ func (c Configuration) String() string {
 type MatchmakerPaxos struct {
 	paxi.Node
 
-	log                    map[int]*entry // log ordered by slot
-	isActiveLeader         bool
+	log                    map[int]*entry         // log ordered by slot
 	matchmakerLog          map[int]*Configuration // log for a matchmakerpaxos node
 	matchmakerHistoryUnion map[paxi.ID]bool       // combination of the union of the config histories
 	numMatchReplies        int                    // count for the number of matchA replies
@@ -86,16 +85,15 @@ type MatchmakerPaxos struct {
 
 	// matchmaker paxos specific
 	configuration       *Configuration
-	prevConfigurations  map[int]*Configuration
-	phase1QuorumReplies map[int]map[paxi.ID]bool
-	phase2QuorumReplies map[int]map[paxi.ID]bool
+	phase1QuorumReplies map[int]map[paxi.ID][]time.Time
+	phase2QuorumReplies map[int]map[paxi.ID][]time.Time
 
-	quorum                 *paxi.Quorum    // phase 1 quorum
-	requests               []*paxi.Request // phase 1 pending requests
-	pendingPhase1BMessages []Phase1B       // pending phase1B messages
+	quorum   *paxi.Quorum    // phase 1 quorum
+	requests []*paxi.Request // phase 1 pending requests
 
-	Q1 func(*paxi.Quorum) bool
-	Q2 func(*paxi.Quorum) bool
+	// tracking performance
+	latencies map[paxi.ID][]time.Duration
+	rwLoads   map[paxi.ID][]int // read/write loads for each acceptor as array [read, write]
 }
 
 // NewMatchmakerPaxos creates new paxos instance
@@ -105,7 +103,6 @@ func NewMatchmakerPaxos(n paxi.Node, acceptors []paxi.ID, matchmakers []paxi.ID,
 
 	p := &MatchmakerPaxos{
 		Node:                   n,
-		isActiveLeader:         false,
 		log:                    make(map[int]*entry, paxi.GetConfig().BufferSize),
 		matchmakerLog:          make(map[int]*Configuration, 0),
 		matchmakerHistoryUnion: make(map[paxi.ID]bool, 0),
@@ -115,14 +112,12 @@ func NewMatchmakerPaxos(n paxi.Node, acceptors []paxi.ID, matchmakers []paxi.ID,
 		acceptors:              acceptors,
 		matchmakers:            matchmakers,
 		configuration:          newConfiguration(paxi.GetConfig().Acceptors, *phase1Quorum, *phase2Quorum),
-		prevConfigurations:     make(map[int]*Configuration, 0),
-		phase1QuorumReplies:    make(map[int]map[paxi.ID]bool, 0),
-		phase2QuorumReplies:   	make(map[int]map[paxi.ID]bool, 0),
+		phase1QuorumReplies:    make(map[int]map[paxi.ID][]time.Time, 0),
+		phase2QuorumReplies:    make(map[int]map[paxi.ID][]time.Time, 0),
 		quorum:                 paxi.NewQuorum(),
 		requests:               make([]*paxi.Request, 0),
-		pendingPhase1BMessages: make([]Phase1B, 0),
-		Q1:                     func(q *paxi.Quorum) bool { return q.Majority() },
-		Q2:                     func(q *paxi.Quorum) bool { return q.Majority() },
+		latencies:              make(map[paxi.ID][]time.Duration, 0),
+		rwLoads:                make(map[paxi.ID][]int, 0),
 	}
 
 	for _, opt := range options {
@@ -138,6 +133,10 @@ func (p *MatchmakerPaxos) selectRandomConfiguration() *Configuration {
 
 	phase1Members := make([]paxi.ID, 0)
 	phase2Members := make([]paxi.ID, 0)
+
+	// base decision on latencies and loads
+	log.Debugf("Latencies: %v\n", p.latencies)
+	log.Debugf("RW Loads: %v\n", p.rwLoads)
 
 	if len(p.acceptors) >= paxi.GetConfig().F*2+1 {
 		for len(phase1Members) <= paxi.GetConfig().F+1 {
@@ -226,9 +225,14 @@ func (p *MatchmakerPaxos) HandleMatchB(r MatchB) {
 				for _, nID := range C_i.Phase1Quorum.Members {
 					p.matchmakerHistoryUnion[nID] = true
 					if _, exists := p.phase1QuorumReplies[p.ballot.N()]; !exists {
-						p.phase1QuorumReplies[r.Ballot.N()] = make(map[paxi.ID]bool)
+						p.phase1QuorumReplies[r.Ballot.N()] = make(map[paxi.ID][]time.Time)
+						p.phase1QuorumReplies[r.Ballot.N()][nID] = make([]time.Time, 2)
 					}
-					p.phase1QuorumReplies[r.Ballot.N()][nID] = false
+
+					if _, exists := p.rwLoads[nID]; !exists {
+						p.rwLoads[nID] = make([]int, 2)
+					}
+					p.rwLoads[nID][0]++ // we increment the read load for this acceptor
 				}
 
 				for _, nID := range C_i.Phase2Quorum.Members {
@@ -238,9 +242,6 @@ func (p *MatchmakerPaxos) HandleMatchB(r MatchB) {
 		}
 		return
 	}
-
-	// save previous configuration
-	p.prevConfigurations = r.ConfigurationHistory
 
 	// once we have f+1 matchB requests we take the union of all
 	// the histories
@@ -258,10 +259,7 @@ func (p *MatchmakerPaxos) HandleMatchB(r MatchB) {
 
 		acceptors = append(acceptors, randomConfig.Phase1Quorum.Members...)
 		if _, exists := p.phase1QuorumReplies[r.Ballot.N()]; !exists {
-			p.phase1QuorumReplies[r.Ballot.N()] = make(map[paxi.ID]bool)
-		}
-		for _, nID := range acceptors {
-			p.phase1QuorumReplies[r.Ballot.N()][nID] = false
+			p.phase1QuorumReplies[r.Ballot.N()] = make(map[paxi.ID][]time.Time)
 		}
 
 		acceptors = append(acceptors, randomConfig.Phase2Quorum.Members...)
@@ -270,6 +268,15 @@ func (p *MatchmakerPaxos) HandleMatchB(r MatchB) {
 	for _, nID := range acceptors {
 		m := Phase1A{Ballot: p.ballot}
 		p.Send(nID, m)
+		if _, exists := p.phase1QuorumReplies[r.Ballot.N()][nID]; !exists {
+			p.phase1QuorumReplies[r.Ballot.N()][nID] = make([]time.Time, 2)
+		}
+		p.phase1QuorumReplies[r.Ballot.N()][nID][0] = time.Now()
+
+		if _, exists := p.rwLoads[nID]; !exists {
+			p.rwLoads[nID] = make([]int, 2)
+		}
+		p.rwLoads[nID][0]++ // we increment the read load for this acceptor
 	}
 
 	// reset numMatchReplies and matchmaker history
@@ -320,33 +327,37 @@ func (p *MatchmakerPaxos) update(scb map[int]CommandBallot) {
 
 func (p *MatchmakerPaxos) updatePhase1QuorumReceipts(roundNum int, acceptor paxi.ID) {
 	if _, exists := p.phase1QuorumReplies[roundNum][acceptor]; exists {
-		p.phase1QuorumReplies[roundNum][acceptor] = true
+		p.phase1QuorumReplies[roundNum][acceptor][1] = time.Now()
 	}
 }
 
 func (p *MatchmakerPaxos) receivedPhaseBFromAllPhase1Quorums(roundNum int) bool {
 	roundQuorum := p.phase1QuorumReplies[roundNum]
-	for _, responded := range roundQuorum {
-		if !responded {
+	for _, timeStartAndEnd := range roundQuorum {
+		if timeStartAndEnd[1].IsZero() {
 			return false
 		}
 	}
 	return true
 }
 
-func(p *MatchmakerPaxos) updatePhase2QuorumReceipts(roundNum int, acceptor paxi.ID) {
+func (p *MatchmakerPaxos) updatePhase2QuorumReceipts(roundNum int, acceptor paxi.ID) {
 	if _, exists := p.phase2QuorumReplies[roundNum][acceptor]; exists {
-		p.phase2QuorumReplies[roundNum][acceptor] = true
+		p.phase2QuorumReplies[roundNum][acceptor][1] = time.Now()
 	}
+	// log.Debugf("Updated phase2 quorum replies for round %d: %v\n", roundNum, p.phase2QuorumReplies[roundNum])
 }
 
 func (p *MatchmakerPaxos) receivedPhaseBFromAllPhase2Quorums(roundNum int) bool {
 	roundQuorum := p.phase2QuorumReplies[roundNum]
-	for _, responded := range roundQuorum {
-		if !responded {
+	// log.Debugf("Checking phase2 quorum replies for round %d: %v\n", roundNum, roundQuorum)
+	for _, timeStartAndEnd := range roundQuorum {
+		if timeStartAndEnd[1].IsZero() {
+			// log.Debugf("Not all phase2 quorum replies received for round %d\n", roundNum)
 			return false
 		}
 	}
+	// log.Debugf("All phase2 quorum replies received for round %d\n", roundNum)
 	return true
 }
 
@@ -361,20 +372,33 @@ func (p *MatchmakerPaxos) HandlePhase1B(r Phase1B) {
 
 	// mark as received from the sending acceptor
 	p.updatePhase1QuorumReceipts(r.Ballot.N(), r.ID)
-	p.pendingPhase1BMessages = append(p.pendingPhase1BMessages, r)
+
+	// update the latencies
+	startTime := p.phase1QuorumReplies[r.Ballot.N()][r.ID][0]
+	endTime := p.phase1QuorumReplies[r.Ballot.N()][r.ID][1]
+	latency := endTime.Sub(startTime)
+
+	if _, exists := p.latencies[r.ID]; !exists {
+		p.latencies[r.ID] = make([]time.Duration, 0)
+	}
+	p.latencies[r.ID] = append(p.latencies[r.ID], latency)
 
 	p.highestVoteRound = paxi.Max(p.highestVoteRound, r.Ballot.N()) // mark the highest vr in Phase1B
 
 	// wait to receive phase1B messages from a phase1Quorum from every configuration in H
 	if !p.receivedPhaseBFromAllPhase1Quorums(r.Ballot.N()) {
-		log.Debugf("Replies for round %d: %v\n", r.Ballot.N(), p.phase1QuorumReplies[r.Ballot.N()])
+		// log.Debugf("Replies for round %d: %v\n", r.Ballot.N(), p.phase1QuorumReplies[r.Ballot.N()])
 		return
 	}
 
-	log.Debugf("Received phase1B messages from all phase1Quorums for round %d\n", r.Ballot.N())
+	// log.Debugf("Received phase1B messages from all phase1Quorums for round %d\n", r.Ballot.N())
 
 	// get ready to track which acceptors have responded to phase2A messages
-	p.phase2QuorumReplies[p.ballot.N()] = make(map[paxi.ID]bool)
+	if _, exists := p.phase2QuorumReplies[p.ballot.N()]; !exists {
+		p.phase2QuorumReplies[p.ballot.N()] = make(map[paxi.ID][]time.Time)
+	}
+
+	// send phase2A messages to every acceptor in our configuration
 
 	// propose any uncommitted entries
 	for i := p.execute; i <= p.slot; i++ {
@@ -397,7 +421,15 @@ func (p *MatchmakerPaxos) HandlePhase1B(r Phase1B) {
 				Slot:    i,
 				Command: p.log[i].command,
 			})
-			p.phase2QuorumReplies[p.ballot.N()][nID] = false
+			if _, exists := p.phase2QuorumReplies[p.ballot.N()][nID]; !exists {
+				p.phase2QuorumReplies[p.ballot.N()][nID] = make([]time.Time, 2)
+			}
+			p.phase2QuorumReplies[p.ballot.N()][nID][0] = time.Now()
+
+			if _, exists := p.rwLoads[nID]; !exists {
+				p.rwLoads[nID] = make([]int, 2)
+			}
+			p.rwLoads[nID][1]++ // we increment the write load for this acceptor
 		}
 	}
 
@@ -426,7 +458,16 @@ func (p *MatchmakerPaxos) HandlePhase1B(r Phase1B) {
 				Slot:    p.slot,
 				Command: req.Command,
 			})
-			p.phase2QuorumReplies[p.ballot.N()][nID] = false
+
+			if _, exists := p.phase2QuorumReplies[p.ballot.N()][nID]; !exists {
+				p.phase2QuorumReplies[p.ballot.N()][nID] = make([]time.Time, 2)
+			}
+			p.phase2QuorumReplies[p.ballot.N()][nID][0] = time.Now()
+
+			if _, exists := p.rwLoads[nID]; !exists {
+				p.rwLoads[nID] = make([]int, 2)
+			}
+			p.rwLoads[nID][1]++ // we increment the write load for this acceptor
 		}
 	}
 
@@ -473,7 +514,7 @@ func (p *MatchmakerPaxos) HandlePhase2B(m Phase2B) {
 	// old message
 	entry, exist := p.log[m.Slot]
 	if !exist || m.Ballot < entry.ballot || entry.commit {
-		log.Debugf("Recevied old message %v\n", m)
+		// log.Debugf("Recevied old message %v\n", m)
 		return
 	}
 
@@ -484,8 +525,20 @@ func (p *MatchmakerPaxos) HandlePhase2B(m Phase2B) {
 
 	// wait to receive phase2B messages from phase 2 quorum, mark the entry as committed
 	p.updatePhase2QuorumReceipts(m.Ballot.N(), m.ID)
+
+	if _, exists := p.phase2QuorumReplies[m.Ballot.N()][m.ID]; exists {
+		startTime := p.phase2QuorumReplies[m.Ballot.N()][m.ID][0]
+		endTime := p.phase2QuorumReplies[m.Ballot.N()][m.ID][1]
+		latency := endTime.Sub(startTime)
+
+		if _, exists := p.latencies[m.ID]; !exists {
+			p.latencies[m.ID] = make([]time.Duration, 0)
+		}
+		p.latencies[m.ID] = append(p.latencies[m.ID], latency)
+	}
+
 	if !p.receivedPhaseBFromAllPhase2Quorums(m.Ballot.N()) {
-		log.Debugf("Replies for round %d: %v\n", m.Ballot.N(), p.phase1QuorumReplies[m.Ballot.N()])
+		log.Debugf("Replies for round %d: %v\n", m.Ballot.N(), p.phase2QuorumReplies[m.Ballot.N()])
 		return
 	}
 
